@@ -11,16 +11,106 @@ use matrix_sdk::{
     },
     Client, SessionMeta, SessionTokens,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use siwx_oidc_auth::SiwxKey;
 use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Config file (persisted OIDC credentials)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_REDIRECT_URI: &str = "http://localhost:0/callback";
+const DEFAULT_CLIENT_NAME: &str = "aqua-matrix-agent";
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ConfigFile {
+    #[serde(default)]
+    pub oidc: OidcConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct OidcConfig {
+    pub client_id: Option<String>,
+    pub redirect_uri: Option<String>,
+}
+
+impl ConfigFile {
+    /// Load config from a TOML file. Returns default if file does not exist.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config: {}", path.display()))?;
+        toml::from_str(&contents)
+            .with_context(|| format!("failed to parse config: {}", path.display()))
+    }
+
+    /// Save config to a TOML file, creating parent directories if needed.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create config dir: {}", parent.display()))?;
+        }
+        let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
+        std::fs::write(path, contents)
+            .with_context(|| format!("failed to write config: {}", path.display()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OIDC dynamic client registration
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterResponse {
+    client_id: String,
+}
+
+/// Register a new OIDC client with the siwx-oidc server via dynamic registration.
+/// Returns (client_id, redirect_uri).
+pub async fn register_oidc_client(siwx_url: &str) -> Result<(String, String)> {
+    let redirect_uri = DEFAULT_REDIRECT_URI.to_string();
+    let url = format!("{}/register", siwx_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "redirect_uris": [&redirect_uri],
+        "client_name": DEFAULT_CLIENT_NAME,
+        "token_endpoint_auth_method": "none"
+    });
+
+    tracing::info!("registering OIDC client at {url}");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("OIDC client registration request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("OIDC registration returned {status}: {body}");
+    }
+
+    let reg: RegisterResponse = resp
+        .json()
+        .await
+        .context("failed to parse OIDC registration response")?;
+
+    tracing::info!("registered OIDC client: {}", reg.client_id);
+    Ok((reg.client_id, redirect_uri))
+}
+
+// ---------------------------------------------------------------------------
+// Agent config and resolution
+// ---------------------------------------------------------------------------
 
 pub struct AgentConfig {
     pub key_file: PathBuf,
     pub siwx_url: String,
     pub matrix_url: String,
-    pub client_id: String,
-    pub redirect_uri: String,
+    pub client_id: Option<String>,
+    pub redirect_uri: Option<String>,
     pub store_dir: PathBuf,
 }
 
@@ -98,11 +188,56 @@ impl AgentClient {
         let did = key.did();
         tracing::info!("agent DID: {did}");
 
+        // Resolve client_id and redirect_uri:
+        //   1. Provided in config (CLI flags or env vars)
+        //   2. Cached in config file
+        //   3. Auto-register with siwx-oidc server
+        let config_path = config.store_dir.join("config.toml");
+        let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
+
+        let (client_id, redirect_uri) = match (config.client_id, config.redirect_uri) {
+            (Some(cid), Some(ruri)) => (cid, ruri),
+            (Some(cid), None) => {
+                let ruri = config_file
+                    .oidc
+                    .redirect_uri
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
+                (cid, ruri)
+            }
+            (None, Some(ruri)) => {
+                let cid = config_file.oidc.client_id.clone().ok_or_else(|| {
+                    anyhow!("--redirect-uri provided without --client-id, and no cached client_id found")
+                })?;
+                (cid, ruri)
+            }
+            (None, None) => {
+                // Try config file first
+                if let Some(cid) = config_file.oidc.client_id.clone() {
+                    let ruri = config_file
+                        .oidc
+                        .redirect_uri
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
+                    tracing::info!("using cached OIDC credentials from {}", config_path.display());
+                    (cid, ruri)
+                } else {
+                    // Auto-register
+                    let (cid, ruri) = register_oidc_client(&config.siwx_url).await?;
+                    config_file.oidc.client_id = Some(cid.clone());
+                    config_file.oidc.redirect_uri = Some(ruri.clone());
+                    config_file.save(&config_path)?;
+                    tracing::info!("saved OIDC credentials to {}", config_path.display());
+                    (cid, ruri)
+                }
+            }
+        };
+
         tracing::info!("authenticating against {}", config.siwx_url);
         let tokens = siwx_oidc_auth::authenticate(
             &config.siwx_url,
-            &config.client_id,
-            &config.redirect_uri,
+            &client_id,
+            &redirect_uri,
             &key,
         )
         .await
@@ -156,6 +291,36 @@ impl AgentClient {
             .await
             .context("initial sync failed")?;
         tracing::info!("connected");
+
+        // Verify device via cross-signing
+        tracing::info!("checking cross-signing status");
+        match client.encryption().cross_signing_status().await {
+            Some(status) if status.is_complete() => {
+                tracing::info!(
+                    "cross-signing keys already present (master={}, self_signing={}, user_signing={})",
+                    status.has_master,
+                    status.has_self_signing,
+                    status.has_user_signing,
+                );
+            }
+            _ => {
+                tracing::info!("bootstrapping cross-signing keys");
+                match client
+                    .encryption()
+                    .bootstrap_cross_signing(None)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!("cross-signing bootstrap complete; device is now verified");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cross-signing bootstrap failed (server may not support it): {e:#}"
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             client,
@@ -290,5 +455,59 @@ impl AgentClient {
             .await
             .context("sync failed")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn config_file_roundtrip() {
+        let dir = std::env::temp_dir().join("aqua-matrix-agent-test");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        // Load from nonexistent file returns defaults
+        let cfg = ConfigFile::load(&path).unwrap();
+        assert!(cfg.oidc.client_id.is_none());
+        assert!(cfg.oidc.redirect_uri.is_none());
+
+        // Save and reload
+        let mut cfg = ConfigFile::default();
+        cfg.oidc.client_id = Some("test-id-123".to_string());
+        cfg.oidc.redirect_uri = Some("http://localhost:0/callback".to_string());
+        cfg.save(&path).unwrap();
+
+        let loaded = ConfigFile::load(&path).unwrap();
+        assert_eq!(loaded.oidc.client_id.as_deref(), Some("test-id-123"));
+        assert_eq!(
+            loaded.oidc.redirect_uri.as_deref(),
+            Some("http://localhost:0/callback")
+        );
+
+        // Verify the TOML format is human-readable
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[oidc]"));
+        assert!(contents.contains("client_id = \"test-id-123\""));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_file_load_partial() {
+        let dir = std::env::temp_dir().join("aqua-matrix-agent-test-partial");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Write a config with only client_id
+        fs::write(&path, "[oidc]\nclient_id = \"partial-id\"\n").unwrap();
+        let loaded = ConfigFile::load(&path).unwrap();
+        assert_eq!(loaded.oidc.client_id.as_deref(), Some("partial-id"));
+        assert!(loaded.oidc.redirect_uri.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

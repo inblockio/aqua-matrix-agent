@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use aqua_matrix_agent::{did_from_key_file, AgentClient, AgentConfig};
 use clap::Parser;
 use std::path::PathBuf;
@@ -18,10 +18,18 @@ struct Args {
     #[arg(long, env = "MATRIX_URL", default_value = "https://matrix.inblock.io")]
     matrix_url: String,
 
-    #[arg(long, env = "OIDC_CLIENT_ID", required_unless_present = "print_did")]
+    #[arg(
+        long,
+        env = "OIDC_CLIENT_ID",
+        help = "OIDC client ID (auto-registered if omitted)"
+    )]
     client_id: Option<String>,
 
-    #[arg(long, env = "OIDC_REDIRECT_URI", required_unless_present = "print_did")]
+    #[arg(
+        long,
+        env = "OIDC_REDIRECT_URI",
+        help = "OIDC redirect URI (defaults to http://localhost:0/callback)"
+    )]
     redirect_uri: Option<String>,
 
     #[arg(
@@ -71,12 +79,8 @@ async fn main() -> Result<()> {
         key_file: args.key_file,
         siwx_url: args.siwx_url,
         matrix_url: args.matrix_url,
-        client_id: args
-            .client_id
-            .ok_or_else(|| anyhow!("--client-id required"))?,
-        redirect_uri: args
-            .redirect_uri
-            .ok_or_else(|| anyhow!("--redirect-uri required"))?,
+        client_id: args.client_id,
+        redirect_uri: args.redirect_uri,
         store_dir: args.store_dir.unwrap_or_else(default_store_dir),
     };
 
