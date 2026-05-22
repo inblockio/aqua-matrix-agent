@@ -1,7 +1,8 @@
 use anyhow::Result;
-use aqua_matrix_agent::{did_from_key_file, AgentClient, AgentConfig};
+use aqua_matrix_agent::{did_from_key_file, heartbeat, AgentClient, AgentConfig};
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +53,19 @@ struct Args {
 
     #[arg(long, help = "Print agent DID and exit")]
     print_did: bool,
+
+    #[arg(
+        long,
+        help = "Run as a heartbeat daemon: send periodic status DMs to --target until killed"
+    )]
+    heartbeat: bool,
+
+    #[arg(
+        long,
+        default_value = "600",
+        help = "Heartbeat interval in seconds (default 600 = 10 minutes)"
+    )]
+    heartbeat_interval: u64,
 }
 
 fn default_store_dir() -> PathBuf {
@@ -89,6 +103,12 @@ async fn main() -> Result<()> {
     let joined = agent.join_invited_rooms().await?;
     if !joined.is_empty() {
         agent.sync_once().await?;
+    }
+
+    if args.heartbeat {
+        let interval = Duration::from_secs(args.heartbeat_interval);
+        heartbeat::run(&agent, &args.target, interval).await;
+        return Ok(());
     }
 
     if let Some(ref msg) = args.message {

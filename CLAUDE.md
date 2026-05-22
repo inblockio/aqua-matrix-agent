@@ -39,7 +39,11 @@ No flags needed beyond `--message`. The agent auto-registers OIDC credentials on
 ~/aqua-matrix-hello/target/release/aqua-matrix-agent --key-file other.pem --store-dir ~/.other-agent --message "hi"
 ```
 
-Each key file produces a unique DID and separate Matrix account. Pre-existing keys: `agent.pem` (Agent A), `agent-b.pem` (Agent B).
+Each key file produces a unique DID and separate Matrix account. Convention on this host:
+
+- `agent.pem` — chat identity (re-created on first chat run if absent)
+- `agent-b.pem` — second test identity for `/e2e-test`
+- `heartbeat.pem` — heartbeat-only identity used by the systemd unit. Do not reuse for chat — its crypto store lives separately at `~/.aqua-matrix-heartbeat/`.
 
 ### Build if binary is missing
 
@@ -92,6 +96,18 @@ The binary lands at `target/release/aqua-matrix-agent`.
 | `--read` | | | Read recent messages |
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |
+| `--heartbeat` | | | Run as a status-DM daemon (see `/heartbeat` skill) |
+| `--heartbeat-interval` | | `600` | Heartbeat tick in seconds |
+
+## Wrapped-harness configuration
+
+This repo runs under `claude-ws` (alias for `claude --dangerously-skip-permissions`, defined at `~/.bashrc:122`). `~/.claude/settings.json` is configured to:
+
+- pin `"model": "claude-opus-4-7"` so every session uses the most capable model
+- expose `CONTEXT_WINDOW=1000000` so the Stop hook + heartbeat report the right context % for the 1M variant
+- register a `Stop` hook at `~/.claude/hooks/compact-at-50.py` that blocks stop with `decision: "block"` and instructs Claude to run `/compact` whenever context usage crosses 50% (`COMPACT_THRESHOLD` env var to tune)
+
+The hook reads the latest `usage.input_tokens` from the active transcript, so token accounting matches whatever the model itself reported.
 
 ## Skills
 
@@ -99,6 +115,20 @@ The binary lands at `target/release/aqua-matrix-agent`.
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
+| `/heartbeat` | Run aqua-matrix-agent as a daemon DMing host/agent/Claude-session status every 10min |
+
+**Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:
+
+```
+Skills/
+  matrix-message/skill.md   <-- canonical content (edit here)
+  e2e-test/skill.md
+.claude/skills/
+  matrix-message -> ../../Skills/matrix-message
+  e2e-test      -> ../../Skills/e2e-test
+```
+
+Edit skills in `Skills/`. Do not duplicate content into `.claude/skills/`. When adding a new skill: create `Skills/<name>/skill.md`, then `ln -s ../../Skills/<name> .claude/skills/<name>`. If `.claude/skills/<name>/skill.md` ever resolves to a regular file instead of a symlink target, the layout has drifted — re-create the symlink.
 
 ## Companion repos
 

@@ -57,6 +57,12 @@ cargo build --release
 | `--read` | | | Read recent messages from the DM room |
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |
+| `--heartbeat` | | | Run as a heartbeat daemon (10-min status DMs by default) |
+| `--heartbeat-interval` | | `600` | Heartbeat interval in seconds |
+
+## Heartbeat daemon
+
+`--heartbeat` puts the binary into a loop that sends a Matrix DM every 10 minutes with agent, host, and (if present) active Claude Code session status. A ready-to-install systemd user unit ships at `systemd/aqua-matrix-heartbeat.service`. See `Skills/heartbeat/skill.md` for setup, payload format, and tuning.
 
 ## Using as a library
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=Aqua Matrix heartbeat (10-minute status DM to default target)
+Documentation=https://github.com/inblockio/aqua-matrix-hello
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/aqua-matrix-hello/target/release/aqua-matrix-agent --heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
+Restart=on-failure
+RestartSec=30s
+# Run in the repo dir so the default agent.pem key file is picked up
+WorkingDirectory=%h/aqua-matrix-hello
+# Forward CONTEXT_WINDOW for accurate context% reporting; matches settings.json
+Environment=CONTEXT_WINDOW=1000000
+# Log to journal under the unit name
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

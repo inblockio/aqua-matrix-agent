@@ -1,3 +1,5 @@
+pub mod heartbeat;
+
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::{
     config::SyncSettings,
