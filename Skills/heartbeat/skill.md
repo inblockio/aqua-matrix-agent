@@ -1,11 +1,33 @@
 ---
 name: heartbeat
-description: Run aqua-matrix-agent as a heartbeat daemon that DMs system status every 10 minutes
+description: Run aqua-matrix-agent as a heartbeat + Matrix command channel (deterministic, no LLM)
 ---
 
-# Heartbeat Daemon
+# Heartbeat + Command Channel
 
-`--heartbeat` puts the agent into a loop: every N seconds (default 600 = 10min) it syncs Matrix and sends a status DM to `--target` containing agent, host, and Claude Code session facts.
+`--heartbeat` puts the agent into a dual-purpose loop:
+
+1. **Heartbeat (outbound)**: every N seconds (default 600 = 10 min) it sends a status DM to `--target` containing agent, host, and Claude Code session facts.
+2. **Command channel (inbound)**: every 30 seconds it polls the same DM room. Messages from `--target` that start with `/` are parsed as commands and answered deterministically — no LLM involved.
+
+## Command list
+
+Sent as plain Matrix DMs from the configured `--target` to the heartbeat's identity:
+
+| Command | Reply |
+|---|---|
+| `/help` | List of supported commands |
+| `/status` | Same payload as a scheduled heartbeat — sent immediately |
+| `/ping` | `pong @ <UTC timestamp>` |
+| `/uptime` | Agent loop uptime + host uptime |
+| `/restart` | Acks, then spawns `systemctl --user restart aqua-matrix-heartbeat`. systemd kills the running daemon and starts a fresh one. |
+| `/logs [N]` | Last N lines from `journalctl --user -u aqua-matrix-heartbeat` (default 10, max 50) |
+
+**Security**: only messages whose sender matches `--target` are honored. Anyone else who DMs the heartbeat identity is ignored. Anything not matching a known command yields `unknown command: ...` plus the help text.
+
+**Watermark**: at startup the daemon sets a high-water timestamp to "now", so commands sent before the daemon came online are not replayed. After every restart, the watermark resets — there is no on-disk command queue.
+
+**`/restart` safety**: because the watermark is initialized after startup, the freshly-started daemon will NOT see the original `/restart` message and will not loop.
 
 ## Quick start (foreground)
 
@@ -25,6 +47,24 @@ Stops on Ctrl+C / SIGTERM. Send failures are logged and retried next tick — th
 # 5-minute interval instead of 10
 ./target/release/aqua-matrix-agent --heartbeat --heartbeat-interval 300
 ```
+
+## Auto-start with WSL
+
+When WSL starts, this chain brings the heartbeat online automatically:
+
+1. `/etc/wsl.conf` has `[boot] systemd=true` → WSL boots systemd inside the distro
+2. `loginctl enable-linger <user>` → the user systemd manager starts at boot, before any interactive login
+3. `systemctl --user enable aqua-matrix-heartbeat` → the unit starts when the user manager comes up
+
+Verify the chain on the host:
+
+```bash
+cat /etc/wsl.conf | grep -A1 boot       # expect systemd=true
+loginctl show-user "$USER" | grep Linger # expect Linger=yes
+systemctl --user is-enabled aqua-matrix-heartbeat  # expect enabled
+```
+
+WSL itself does NOT start automatically when Windows boots — open any WSL terminal once or set up a Windows scheduled task running `wsl --distribution <name> --exec true` at logon if you need that. After WSL is running, the unit comes up without further user action.
 
 ## Persistent install (systemd user unit)
 

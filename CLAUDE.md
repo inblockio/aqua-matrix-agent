@@ -74,12 +74,13 @@ aqua-matrix-agent (binary)
 ## Building and testing
 
 ```bash
-cargo build --release                        # build binary
+cargo build                                  # debug build for iteration (DEFAULT — fast)
+cargo build --release                        # only when shipping; do not use during dev
 cargo test                                   # run unit tests (config roundtrip, partial loading)
 cargo test --test e2e --features e2e         # run E2E test (requires live matrix.inblock.io)
 ```
 
-The binary lands at `target/release/aqua-matrix-agent`.
+The binary lands at `target/debug/aqua-matrix-agent` (debug) or `target/release/aqua-matrix-agent` (release). The systemd heartbeat unit points at the debug path on purpose — keeps rebuild cycles tight.
 
 ## CLI flags
 
@@ -115,7 +116,7 @@ The hook reads the latest `usage.input_tokens` from the active transcript, so to
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
-| `/heartbeat` | Run aqua-matrix-agent as a daemon DMing host/agent/Claude-session status every 10min |
+| `/heartbeat` | Run aqua-matrix-agent as a daemon DMing status every 10min AND honoring `/help`, `/status`, `/ping`, `/uptime`, `/restart`, `/logs` commands sent from `--target` |
 
 **Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:
 

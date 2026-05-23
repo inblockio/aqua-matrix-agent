@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/aqua-matrix-hello/target/release/aqua-matrix-agent --heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
+ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
 Restart=on-failure
 RestartSec=30s
 # Run in the repo dir so the default agent.pem key file is picked up

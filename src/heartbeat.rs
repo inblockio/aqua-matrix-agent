@@ -1,22 +1,37 @@
-//! Heartbeat: periodically DM a status payload to a Matrix target.
+//! Heartbeat: periodically DM a status payload to a Matrix target AND act as a
+//! deterministic command channel that accepts `/command` DMs from the target.
 //!
-//! Payload bundles three categories of facts:
-//!   * agent-side  — uptime since loop start, heartbeats sent, last error
+//! Status payload bundles three categories of facts:
+//!   * agent-side  — uptime since loop start, heartbeats sent, last error, commands handled
 //!   * host        — hostname, host uptime, load, free RAM, disk on /
 //!   * Claude Code — most-recent active transcript's context usage, model, last tool/user
 //!
-//! The loop never returns under normal operation: send failures are logged and
-//! retried on the next tick rather than crashing the daemon. Stop it with a
-//! signal (SIGTERM/SIGINT) — systemd handles this for the user unit.
+//! Commands (only honored when sender == --target):
+//!   /help      list commands
+//!   /status    immediate status payload
+//!   /ping      pong + timestamp
+//!   /uptime    agent + host uptime
+//!   /restart   spawn `systemctl --user restart aqua-matrix-heartbeat`
+//!   /logs [N]  last N journal lines (default 10, capped at 50)
+//!
+//! Inner loop ticks every COMMAND_POLL_INTERVAL (30s) to remain responsive to
+//! commands; the heartbeat payload is sent on the user-supplied interval
+//! (default 600s). The watermark used to skip already-processed messages is
+//! initialized to "now" at startup, so commands sent before the daemon came
+//! online are NOT replayed — this is what stops /restart from looping.
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::AgentClient;
+
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const COMMAND_FETCH_LIMIT: u32 = 20;
 
 pub struct HeartbeatStats {
     start: Instant,
     sent: u64,
     last_err: Option<String>,
+    commands_handled: u64,
 }
 
 impl HeartbeatStats {
@@ -25,15 +40,20 @@ impl HeartbeatStats {
             start: Instant::now(),
             sent: 0,
             last_err: None,
+            commands_handled: 0,
         }
     }
 }
 
 pub async fn run(agent: &AgentClient, target: &str, interval: Duration) {
     let mut stats = HeartbeatStats::new();
+    let mut watermark_ms: u64 = now_epoch_ms();
+    let mut last_heartbeat: Option<Instant> = None;
+
     tracing::info!(
-        "heartbeat loop starting (interval: {}s, target: {target})",
-        interval.as_secs()
+        "heartbeat loop starting (heartbeat interval: {}s, command poll: {}s, target: {target}, watermark_ms: {watermark_ms})",
+        interval.as_secs(),
+        COMMAND_POLL_INTERVAL.as_secs()
     );
 
     loop {
@@ -41,22 +61,167 @@ pub async fn run(agent: &AgentClient, target: &str, interval: Duration) {
             tracing::warn!("heartbeat: sync failed: {e:#}");
         }
 
-        let body = build_status(&stats);
-        match agent.send_dm(target, &body).await {
-            Ok(event_id) => {
-                stats.sent += 1;
-                stats.last_err = None;
-                tracing::info!("heartbeat sent (event: {event_id})");
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                tracing::warn!("heartbeat send failed: {msg}");
-                stats.last_err = Some(msg);
-            }
+        watermark_ms = process_commands(agent, target, &mut stats, watermark_ms).await;
+
+        let due = match last_heartbeat {
+            None => true,
+            Some(t) => t.elapsed() >= interval,
+        };
+        if due {
+            send_heartbeat(agent, target, &mut stats).await;
+            last_heartbeat = Some(Instant::now());
         }
 
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
     }
+}
+
+async fn send_heartbeat(agent: &AgentClient, target: &str, stats: &mut HeartbeatStats) {
+    let body = build_status(stats);
+    match agent.send_dm(target, &body).await {
+        Ok(event_id) => {
+            stats.sent += 1;
+            stats.last_err = None;
+            tracing::info!("heartbeat sent (event: {event_id})");
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::warn!("heartbeat send failed: {msg}");
+            stats.last_err = Some(msg);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command channel
+// ---------------------------------------------------------------------------
+
+async fn process_commands(
+    agent: &AgentClient,
+    target: &str,
+    stats: &mut HeartbeatStats,
+    mut watermark_ms: u64,
+) -> u64 {
+    let room_id = match agent.dm_room_id(target).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return watermark_ms,
+        Err(e) => {
+            tracing::warn!("command: dm_room_id failed: {e:#}");
+            return watermark_ms;
+        }
+    };
+
+    let messages = match agent.messages(&room_id, COMMAND_FETCH_LIMIT).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("command: messages fetch failed: {e:#}");
+            return watermark_ms;
+        }
+    };
+
+    for msg in &messages {
+        if msg.timestamp_ms <= watermark_ms {
+            continue;
+        }
+        if msg.sender != target {
+            // Always advance watermark so we don't keep re-considering this message
+            watermark_ms = msg.timestamp_ms;
+            continue;
+        }
+        let body = msg.body.trim();
+        if !body.starts_with('/') {
+            watermark_ms = msg.timestamp_ms;
+            continue;
+        }
+
+        tracing::info!("command from {}: {}", msg.sender, body);
+        let reply = handle_command(body, stats);
+        stats.commands_handled += 1;
+        watermark_ms = msg.timestamp_ms;
+
+        if let Err(e) = agent.send_dm(target, &reply).await {
+            tracing::warn!("command reply send failed: {e:#}");
+        }
+    }
+
+    watermark_ms
+}
+
+fn handle_command(input: &str, stats: &HeartbeatStats) -> String {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let cmd = parts.first().copied().unwrap_or("").to_lowercase();
+
+    match cmd.as_str() {
+        "/help" => help_text(),
+        "/ping" => format!("pong @ {}", now_string()),
+        "/status" => build_status(stats),
+        "/uptime" => format!(
+            "agent up {} | host up {}",
+            format_duration(stats.start.elapsed()),
+            host_uptime().unwrap_or_else(|| "?".into()),
+        ),
+        "/restart" => {
+            match std::process::Command::new("systemctl")
+                .args(["--user", "restart", "aqua-matrix-heartbeat"])
+                .spawn()
+            {
+                Ok(_) => "restarting heartbeat unit (systemctl --user restart aqua-matrix-heartbeat)".to_string(),
+                Err(e) => format!("/restart failed to spawn systemctl: {e}"),
+            }
+        }
+        "/logs" => {
+            let n = parts
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(10)
+                .clamp(1, 50);
+            recent_logs(n).unwrap_or_else(|| "could not read journal logs".into())
+        }
+        other => format!("unknown command: {other}\n\n{}", help_text()),
+    }
+}
+
+fn help_text() -> String {
+    [
+        "aqua-matrix-agent heartbeat — supported commands:",
+        "  /help        this message",
+        "  /status      send a status payload now (same content as periodic heartbeat)",
+        "  /ping        reply pong + timestamp",
+        "  /uptime      agent + host uptime",
+        "  /restart     restart the heartbeat systemd unit",
+        "  /logs [N]    last N journal lines (default 10, max 50)",
+        "",
+        "Commands are honored only when sender matches the configured --target.",
+    ]
+    .join("\n")
+}
+
+fn recent_logs(n: usize) -> Option<String> {
+    let out = std::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            "aqua-matrix-heartbeat",
+            "--no-pager",
+            "-n",
+            &n.to_string(),
+            "-o",
+            "short",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Some(s.into_owned())
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn build_status(stats: &HeartbeatStats) -> String {
@@ -65,9 +230,10 @@ fn build_status(stats: &HeartbeatStats) -> String {
     out.push_str("----------------------------------------\n");
 
     out.push_str(&format!(
-        "agent : up {}, sent {}",
+        "agent : up {}, sent {}, cmds {}",
         format_duration(stats.start.elapsed()),
-        stats.sent
+        stats.sent,
+        stats.commands_handled,
     ));
     if let Some(err) = &stats.last_err {
         out.push_str(&format!(", last_err: {}", truncate(err, 120)));
