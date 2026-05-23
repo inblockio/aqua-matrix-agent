@@ -55,6 +55,6 @@ Both paths run `ExecStop` (`tmux kill-session -t claude-bridge`) followed by `Ex
 
 ## Failure modes
 
-- **Bridge `active` but tmux session missing**: usually because the claude process exited (e.g. `/quit` typed inside the bridge). tmux's session ends when its last command does. Fix: `systemctl --user restart claude-bridge`.
+- **Bridge `active` but tmux session missing**: should no longer happen — the unit now uses a `Type=simple` supervisor that polls `tmux has-session` every 10s and re-runs `tmux new-session` if missing (so the inner claude exiting / `/quit` / crash respawns on its own within ~10s). If you see this anyway, check `journalctl --user -u claude-bridge -n 30` for `spawn failed` lines and the cause (PATH, claude binary missing, etc).
 - **`tmux: failed to connect to server`**: tmux server died. Restart the unit; it spawns a new server transparently.
 - **`claude: command not found` in journal**: PATH issue. Verify `which claude` resolves and update the unit's `ExecStart` if the binary moved.

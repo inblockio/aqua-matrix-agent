@@ -13,8 +13,10 @@ Type=simple
 # auth gets a new device_id and the in-code store-mismatch handler wipes
 # matrix-sdk-*.sqlite3* and retries restore_session once.
 ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
-Restart=on-failure
-RestartSec=30s
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=10
 # Run in the repo dir so the default agent.pem key file is picked up
 WorkingDirectory=%h/aqua-matrix-hello
 # Forward CONTEXT_WINDOW for accurate context% reporting; matches settings.json

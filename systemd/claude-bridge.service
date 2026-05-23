@@ -3,18 +3,25 @@ Description=Persistent claude-ws session in tmux (LLM-Claude-Agent-Bridge)
 Documentation=https://github.com/inblockio/aqua-matrix-hello
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
-# `tmux new-session -d` returns once the session is detached, so we use
-# oneshot+RemainAfterExit: systemd considers the unit active for as long as
-# the tmux session exists. `systemctl --user restart` runs ExecStop (kill
-# the session) then ExecStart (recreate it) — that is what `#shell respawn`
-# in the heartbeat triggers.
-Type=oneshot
-RemainAfterExit=yes
+# Run a supervisor loop as the unit's main process. The loop keeps a tmux
+# session called `claude-bridge` alive: every 10s it checks whether the
+# session exists and (re)spawns it if not. When the inner `claude` process
+# exits (crash, `/quit`, etc.) the tmux session ends and is recreated on
+# the next tick — so the unit reflects real session state rather than
+# remaining nominally "active" with a dead session, which was the bug in
+# the original Type=oneshot+RemainAfterExit version.
+#
+# If the supervisor itself dies, systemd respawns it via Restart=always.
+Type=simple
 WorkingDirectory=%h/aqua-matrix-hello
-ExecStart=/usr/bin/tmux new-session -d -s claude-bridge -- %h/.local/bin/claude --dangerously-skip-permissions
+ExecStart=/bin/bash -c 'while true; do if ! /usr/bin/tmux has-session -t claude-bridge 2>/dev/null; then /usr/bin/tmux new-session -d -s claude-bridge -- "$HOME/.local/bin/claude" --dangerously-skip-permissions && echo "[claude-bridge supervisor] spawned tmux session" || echo "[claude-bridge supervisor] spawn failed"; fi; sleep 10; done'
 ExecStop=/usr/bin/tmux kill-session -t claude-bridge
+Restart=always
+RestartSec=5s
 
 [Install]
 WantedBy=default.target

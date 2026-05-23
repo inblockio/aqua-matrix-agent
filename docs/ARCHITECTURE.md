@@ -117,6 +117,20 @@ So practical operation — restarts within a single day, or even after a long we
 
 **Upstream dependency:** this design relies on `siwx-oidc-auth` shipping `AuthTokens.refresh_token` and `siwx_oidc_auth::refresh(...)`. Since commit `ab3ad3f` of the siwx-oidc repo these are available; we depend via `path = "../siwx-oidc/siwx-oidc-auth"` (sibling checkout) rather than a pinned git rev, because the newer commit's workspace also requires the `aqua-auth` crate at `../../aqua-auth` which cargo cannot fetch through a single git dep. To set up a fresh dev host: `git clone https://github.com/inblockio/siwx-oidc.git && git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
 
+## Auto-respawn (always alive)
+
+All three systemd units use `Restart=always` (Matrix daemons) or a supervisor loop (claude-bridge) so that any kill, crash, or clean exit triggers an automatic respawn:
+
+| Unit | Mechanism | Crash → up in |
+|---|---|---|
+| `aqua-matrix-heartbeat` | `Restart=always`, `RestartSec=5s` + `StartLimitBurst=10 / IntervalSec=300` | ~5s |
+| `aqua-matrix-claude-channel` | same | ~5s |
+| `claude-bridge` | `Type=simple` bash supervisor that polls `tmux has-session` every 10s and re-runs `tmux new-session` if missing; plus `Restart=always` on the supervisor itself | ~10s (inner claude respawn) or ~5s (supervisor respawn) |
+
+Acid-tested on this host: `kill -9 $(pid_of_heartbeat)` → systemd respawned in <5s, NRestarts=1, cached session reused (no auth storm). `tmux kill-session -t claude-bridge` → supervisor respawned the session on its next 10s tick.
+
+Crash-loop guard: `StartLimitBurst=10` over `StartLimitIntervalSec=300` means systemd will give up after 10 restarts in 5 minutes — covers the case where the daemon is fundamentally broken (e.g. siwx-oidc unreachable) without burning through retries forever. After the limit, `systemctl --user reset-failed <unit>` re-enables restarts once the root cause is fixed.
+
 ## Auto-start chain (WSL boot → daemons up)
 
 ```
