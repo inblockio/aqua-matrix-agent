@@ -210,3 +210,114 @@ commits rather than a long transcript.
 ## Handover log
 
 _(appended per phase during execution)_
+
+## Handover — Phase A
+
+### What shipped
+
+`crates/aqua-matrix-claude-p` gained two modules and a gated run flow:
+
+- **`src/destructive.rs`** — the single auditable matcher. Table-driven
+  (`RULES: &[Rule]`), each row carrying whole-**word** needles (`rm`, `rmdir` —
+  token-boundary matched so "alarm"/"form" don't trip it), **substring** needles
+  (`git push --force`, `git push -f`, `--force-with-lease`, `-delete`), and the
+  Phase-C `--allowedTools` scope (`Bash(rm:*)`, `Bash(git push --force*)`).
+  Public API: `classify(text) -> Option<&'static str>` and
+  `looks_destructive(text) -> bool`. 4 unit tests.
+- **`src/pending.rs`** — the shared **`ask_user` primitive** (the pending-reply
+  router). `PendingMap` = `Arc<Mutex<HashMap<String /*target MXID*/,
+  oneshot::Sender<String>>>>`, `Clone`/`Default`. Methods:
+  - `try_resolve(target, body) -> bool` — called first in `handle_message`; if a
+    question is open for `target`, consumes the DM as the answer (returns true).
+  - `ask(agent, target, question, timeout) -> Option<String>` — registers the
+    oneshot **before** sending the DM (closes the fast-reply race), awaits with
+    timeout; `None` on timeout / send-fail / dropped channel and callers MUST
+    treat `None` as **deny** (fail closed). Poisoned lock → deny.
+  - `is_pending(target)` — reserved for B/C (`#[allow(dead_code)]`).
+  4 unit tests covering routing + the overwrite-denies-old-waiter race.
+- **`src/main.rs`** — `ClaudePHandler` now holds `pending: PendingMap` plus a
+  per-target `run_locks` map (`Arc<tokio::Mutex<()>>` per target) so only **one
+  run / one open question per user** at a time. `handle_message` checks
+  `try_resolve` first; otherwise spawns a task that holds the per-target lock and
+  branches: destructive → `run_gated`, else original `stream_claude` path.
+  `stream_claude` was refactored to take a `ClaudeRun { prompt, permission_mode,
+  resume_session }` (`::fresh` / `::plan` / `::resume`) and return
+  `RunOutcome { session_id }` (parsed from the `init` event, `result` as
+  fallback).
+
+### `ask_user` seam for B/C to reuse
+
+```rust
+// crates/aqua-matrix-claude-p/src/pending.rs
+impl PendingMap {
+    pub fn try_resolve(&self, target: &str, body: &str) -> bool;
+    pub async fn ask(&self, agent: &AgentClient, target: &str,
+                     question: &str, timeout: Duration) -> Option<String>; // None == DENY
+    pub fn is_pending(&self, target: &str) -> bool;
+}
+```
+
+It lives on the handler crate (not the relay trait) deliberately — matches the
+opt-in `typing_guard`/`reply_stream` house style and keeps `MessageHandler`
+minimal. Phase B's MCP `ask_human` IPC handler and Phase C's control-request
+gate both call `pending.ask(...)` the same way; only the trigger differs.
+Per-target serialization is provided by the handler's `run_locks` (B/C should
+reuse the same lock so a confirmation can't race a new prompt).
+
+### Verified `claude` plan-mode / resume behaviour (v2.1.157, empirical)
+
+Exact flags and shapes the code relies on:
+
+1. **Plan preview (no execution):**
+   `claude -p --permission-mode plan "<prompt>" --output-format stream-json --verbose`
+   - Model investigates with **read-only** tools (it DID run `ls`/`cat`/`Read`),
+     then calls `ExitPlanMode { plan, allowedPrompts, planFilePath }`.
+   - Headless, `ExitPlanMode` is **auto-DENIED** (`result.permission_denials =
+     ["ExitPlanMode"]`); **no destructive tool runs**. Confirmed across 3 runs —
+     target files always survived plan mode.
+   - The plan text is delivered in the terminal `{"type":"result", "result":
+     "<plan/summary>", "session_id":"…"}` event (and `ExitPlanMode.plan`).
+   - Session id is in the `{"type":"system","subtype":"init","session_id":"…"}`
+     event (also echoed on `result`).
+2. **Approve → execute (same session):**
+   `claude -p --resume <session_id> "Approved. Proceed with the plan." --permission-mode acceptEdits --output-format stream-json --verbose`
+   - Resumes the SAME `session_id`, exits plan mode, runs the `rm`
+     (`result.permission_denials = []`, `is_error=false`). File deleted only
+     here.
+3. **Deny → no resume → state intact:** proven by running step 1 only and
+   confirming the target file still exists.
+
+So Phase A gates **all destructive-classified prompts** via
+plan-then-approve-then-resume (acceptEdits). Non-destructive prompts keep the
+original direct one-shot stream — no behaviour change.
+
+### Autonomous verification (done, no Matrix client needed)
+
+- `cargo build` — clean, **zero warnings**.
+- `cargo test` — 8/8 pass (4 matcher, 4 pending-router incl. race cases).
+- `claude` plan/resume/deny behaviour confirmed empirically (above), all
+  filesystem targets under `/tmp/confirm-test/` only.
+
+### Needs a LIVE user Matrix test
+
+- The end-to-end chat round-trip: DM a destructive request to the
+  claude-channel daemon, see the streamed plan + the `[confirm] … reply yes/no`
+  question, reply `yes`/`no`, and confirm execute-vs-abort. The `ask_user`
+  routing, timeout-deny, typing/stream UX, and the `send_dm` inside `ask` are
+  only unit/empirically tested, not exercised over a real E2EE room. (Do NOT
+  restart the production daemon for me — user will run this.)
+
+### Deviations / notes / follow-ups
+
+- Approval words accepted: `yes/y/approve/approved/ok/proceed` (case-insensitive,
+  trimmed); anything else (incl. `no`, empty, timeout) = **deny**.
+- `APPROVAL_TIMEOUT` = 180s (== `CLAUDE_TIMEOUT`, the plan's "≤ CLAUDE_TIMEOUT").
+- The resume run is `acceptEdits`, not full `--dangerously-skip-permissions`:
+  it auto-accepts the already-planned actions but is not a blanket bypass. If a
+  resumed run hits a *new* permission prompt with no TTY it would stall to
+  timeout (fail-safe) — Phase C's stream-json control path is the real fix.
+- Per-target `run_locks` entries are never evicted; fine for a small fixed
+  fleet (one `target` per daemon today). Revisit if multi-target.
+- Matcher classifies the **prompt text**, not the eventual tool call — coarse by
+  design (fail-loud). Phase C reuses `classify`/`RULES` against concrete
+  `Bash(...)` calls for precise enforcement.
