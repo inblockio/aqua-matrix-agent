@@ -1,27 +1,31 @@
-[package]
-name = "aqua-matrix-agent"
+[workspace]
+resolver = "2"
+members = [
+    "crates/aqua-matrix-agent",
+    "crates/aqua-matrix-relay",
+    "crates/aqua-matrix-heartbeat",
+    "crates/aqua-matrix-claude-p",
+]
+
+# Shared metadata for every crate in the workspace. Members opt in with
+# `version.workspace = true` etc.
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Matrix agent library and CLI for the Aqua Protocol, using siwx-oidc DID authentication"
 license = "Apache-2.0"
 repository = "https://github.com/inblockio/aqua-matrix-hello"
 
-[lib]
-name = "aqua_matrix_agent"
-
-[[bin]]
-name = "aqua-matrix-agent"
-path = "src/main.rs"
-
-[features]
-e2e = ["dep:uuid"]
-
-[dependencies]
-uuid = { version = "1", features = ["v4"], optional = true }
+# Single source of truth for dependency versions. Path deps here resolve
+# relative to THIS file (the workspace root), so the siwx-oidc sibling keeps
+# its short `../siwx-oidc/...` path regardless of how deep a member crate is.
+[workspace.dependencies]
+aqua-matrix-agent = { path = "crates/aqua-matrix-agent" }
+aqua-matrix-relay = { path = "crates/aqua-matrix-relay" }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
 matrix-sdk = { version = "0.17", features = ["markdown"] }
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,3 +34,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
+uuid = { version = "1", features = ["v4"] }

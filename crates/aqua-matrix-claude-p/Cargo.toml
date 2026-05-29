@@ -1,0 +1,20 @@
+[package]
+name = "aqua-matrix-claude-p"
+version.workspace = true
+edition.workspace = true
+description = "Reference example agent backend: forwards each inbound DM to `claude -p <prompt>` and replies with stdout. A placeholder that validates the message bridge — swap in any backend by implementing MessageHandler."
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aqua-matrix-claude-p"
+path = "src/main.rs"
+
+[dependencies]
+aqua-matrix-relay.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

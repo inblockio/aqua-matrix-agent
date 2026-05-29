@@ -1,8 +1,7 @@
 use anyhow::Result;
-use aqua_matrix_agent::{did_from_key_file, claude_channel, heartbeat, AgentClient, AgentConfig};
+use aqua_matrix_agent::{did_from_key_file, AgentClient, AgentConfig};
 use clap::Parser;
 use std::path::PathBuf;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -53,25 +52,6 @@ struct Args {
 
     #[arg(long, help = "Print agent DID and exit")]
     print_did: bool,
-
-    #[arg(
-        long,
-        help = "Run as a heartbeat daemon: send periodic status DMs to --target until killed"
-    )]
-    heartbeat: bool,
-
-    #[arg(
-        long,
-        default_value = "600",
-        help = "Heartbeat interval in seconds (default 600 = 10 minutes)"
-    )]
-    heartbeat_interval: u64,
-
-    #[arg(
-        long,
-        help = "Run as the claude-channel daemon: forward inbound DMs from --target through `claude -p` and reply with stdout. Mutually exclusive with --heartbeat."
-    )]
-    claude_channel: bool,
 }
 
 fn default_store_dir() -> PathBuf {
@@ -104,24 +84,10 @@ async fn main() -> Result<()> {
         store_dir: args.store_dir.unwrap_or_else(default_store_dir),
     };
 
-    if args.heartbeat && args.claude_channel {
-        anyhow::bail!("--heartbeat and --claude-channel are mutually exclusive");
-    }
-
-    // Daemon modes own their own AgentClient lifecycle (they rotate it every
-    // few minutes ahead of token expiry — see heartbeat::run / claude_channel::run).
-    if args.heartbeat {
-        let interval = Duration::from_secs(args.heartbeat_interval);
-        heartbeat::run(config, &args.target, interval).await;
-        return Ok(());
-    }
-
-    if args.claude_channel {
-        claude_channel::run(config, &args.target).await;
-        return Ok(());
-    }
-
-    // One-shot CLI invocations connect once and exit.
+    // One-shot CLI: connect once and exit. The long-running daemon modes moved
+    // to their own binaries (aqua-matrix-heartbeat, aqua-matrix-claude-p) over
+    // the aqua-matrix-relay lifecycle — this binary is now purely the
+    // send/read/print-did tool documented in CLAUDE.md.
     let agent = AgentClient::connect(config).await?;
 
     let joined = agent.join_invited_rooms().await?;

@@ -5,7 +5,7 @@ description: Matrix LLM channel — DMs from --target are forwarded to `claude -
 
 # Matrix Claude Channel
 
-Separate Matrix identity (`claude-channel.pem` + `~/.aqua-matrix-claude-channel/` store) running the binary in `--claude-channel` mode. Each inbound DM from the configured `--target` becomes a fresh `claude -p <prompt>` invocation; stdout is sent back as a Matrix reply. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design and why this is a separate daemon from the heartbeat.
+Separate Matrix identity (`claude-channel.pem` + `~/.aqua-matrix-claude-channel/` store) running the `aqua-matrix-claude-p` binary. Each inbound DM from the configured `--target` becomes a fresh `claude -p <prompt>` invocation; stdout is sent back as a Matrix reply. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design and why this is a separate daemon from the heartbeat.
 
 ## Quick check
 

@@ -1,0 +1,21 @@
+[package]
+name = "aqua-matrix-heartbeat"
+version.workspace = true
+edition.workspace = true
+description = "Ops/heartbeat agent: periodic host-status DMs + a `#shell` command channel, over the aqua-matrix-relay daemon. Host-specific telemetry, kept out of the generic reference."
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aqua-matrix-heartbeat"
+path = "src/main.rs"
+
+[dependencies]
+aqua-matrix-relay.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

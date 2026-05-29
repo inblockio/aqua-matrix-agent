@@ -1,48 +1,20 @@
-//! Heartbeat daemon: 10-min status DM + `#shell` command channel, driven by
-//! matrix-sdk's continuous sync stream (near-realtime, not polling).
-//!
-//! Three concurrent tasks per client lifecycle:
-//!   1. background sync (`client.sync()` looping forever) — pulls events
-//!   2. message event handler (registered before sync starts) — dispatches commands
-//!   3. heartbeat timer (this function's main loop) — sends status every `interval`
-//!
-//! Resilience: an outer loop owns AgentClient lifecycle. ~30 s before the
-//! siwx-oidc access token expires, the inner cycle returns, the AgentClient
-//! is dropped, and a fresh one is built via `AgentClient::connect` — which
-//! hits the tier-2 refresh-grant path, preserves device_id, and leaves the
-//! crypto store untouched. This avoids the M_UNKNOWN_TOKEN sync-loop wedge
-//! that matrix-sdk has no public hook to recover from on its own.
-//!
-//! See docs/ARCHITECTURE.md for the full design and rationale.
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+//! The ops/heartbeat [`MessageHandler`]: status payloads on a timer + a
+//! `#shell` command channel. All of this is host-specific telemetry (host
+//! facts, the Claude Code transcript snoop, journal access, systemd control),
+//! which is why it lives here and not in the generic relay.
 
-use matrix_sdk::{
-    config::SyncSettings,
-    room::Room,
-    ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use aqua_matrix_relay::{async_trait, AgentClient, MessageHandler};
 use tokio::sync::Mutex;
 
-use crate::{AgentClient, AgentConfig};
+const ROLE: &str = "heartbeat";
+const UNIT: &str = "aqua-matrix-heartbeat";
 
-/// Refresh `REFRESH_GUARD_SECS` before the access token expires server-side.
-/// 30 s gives the tier-2 refresh-grant round trip + new initial sync ample
-/// headroom inside the (typically 300 s) token TTL.
-const REFRESH_GUARD_SECS: u64 = 30;
-/// Minimum sleep between rotations. Bounds the worst case where the token
-/// already arrived close to expiry — better to rotate immediately than to
-/// hammer siwx-oidc, but still give one heartbeat tick a chance to fire.
-const MIN_CYCLE_SECS: u64 = 15;
-/// After this many consecutive `AgentClient::connect` failures, exit so
-/// systemd's `Restart=always` brings up a fresh process. The connect path
-/// can leak matrix-sdk / SQLite resources on partial-build failures; a
-/// fresh process resets that state. `StartLimitBurst` still guards against
-/// runaway restarts.
-const MAX_CONNECT_FAILURES: u32 = 3;
-
+/// Counters that survive client rotations — a token-rotation restart should
+/// look like uninterrupted uptime to the operator, not a fresh boot.
 pub struct HeartbeatStats {
     start: Instant,
     sent: u64,
@@ -61,250 +33,92 @@ impl HeartbeatStats {
     }
 }
 
-pub async fn run(config: AgentConfig, target: &str, interval: Duration) {
-    // Stats survive client rotations — restart-on-token-rotation should look
-    // like uninterrupted uptime to the operator, not a fresh boot.
-    let stats = Arc::new(Mutex::new(HeartbeatStats::new()));
-    let target = Arc::new(target.to_string());
+pub struct OpsHandler {
+    stats: Arc<Mutex<HeartbeatStats>>,
+    interval: Duration,
+}
 
-    tracing::info!(
-        "heartbeat daemon starting (heartbeat interval: {}s, target: {}, sync: stream, refresh-guard: {}s)",
-        interval.as_secs(),
-        target,
-        REFRESH_GUARD_SECS,
-    );
-
-    let mut first_cycle = true;
-    let mut consecutive_failures: u32 = 0;
-    loop {
-        let agent = match AgentClient::connect(config.clone()).await {
-            Ok(a) => {
-                consecutive_failures = 0;
-                a
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                tracing::error!(
-                    "heartbeat: AgentClient::connect failed ({consecutive_failures}/{MAX_CONNECT_FAILURES}): {e:#}"
-                );
-                if consecutive_failures >= MAX_CONNECT_FAILURES {
-                    tracing::error!(
-                        "heartbeat: {MAX_CONNECT_FAILURES} consecutive connect failures; exiting for systemd Restart=always (avoids in-process resource accumulation)"
-                    );
-                    std::process::exit(1);
-                }
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                continue;
-            }
-        };
-
-        if let Err(e) = agent.join_invited_rooms().await {
-            tracing::warn!("heartbeat: join_invited_rooms failed: {e:#}");
+impl OpsHandler {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            stats: Arc::new(Mutex::new(HeartbeatStats::new())),
+            interval,
         }
+    }
+}
 
-        let now = unix_now_secs();
-        let ttl = agent
-            .expires_at_unix()
-            .saturating_sub(now)
-            .saturating_sub(REFRESH_GUARD_SECS)
-            .max(MIN_CYCLE_SECS);
-        let refresh_deadline = tokio::time::Instant::now() + Duration::from_secs(ttl);
-        tracing::info!(
-            "heartbeat: client cycle starting (token ttl {}s, rotating in {}s)",
-            agent.expires_at_unix().saturating_sub(now),
-            ttl,
-        );
+#[async_trait]
+impl MessageHandler for OpsHandler {
+    fn role(&self) -> &str {
+        ROLE
+    }
 
-        if first_cycle {
-            let hello = format!(
-                "[hello] aqua-matrix-heartbeat online @ {} (identity: {}). I send a status payload every {}s. Reply with `#shell help` for the command list.",
-                now_string(),
-                agent.user_id(),
-                interval.as_secs(),
-            );
-            if let Err(e) = agent.send_dm(&target, &hello).await {
-                tracing::warn!("hello send failed: {e:#}");
-            }
-            first_cycle = false;
-        }
+    fn systemd_unit(&self) -> Option<&str> {
+        Some(UNIT)
+    }
 
-        // Upsert the fleet-registry entry on every client cycle start so a
-        // freshly-rotated session re-announces itself promptly. Best-effort:
-        // never let a registry failure perturb the heartbeat.
-        if let Err(e) = agent.update_registry("heartbeat", Some("aqua-matrix-heartbeat")).await {
+    fn hello(&self, agent: &AgentClient) -> Option<String> {
+        Some(format!(
+            "[hello] aqua-matrix-heartbeat online @ {} (identity: {}). I send a status payload every {}s. Reply with `#shell help` for the command list.",
+            now_string(),
+            agent.user_id(),
+            self.interval.as_secs(),
+        ))
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(self.interval)
+    }
+
+    async fn on_tick(&self, agent: &AgentClient, target: &str) {
+        // Refresh the fleet-registry entry every tick so `last_online` stays
+        // current. Best-effort — a registry failure must never skip the status.
+        if let Err(e) = agent.update_registry(ROLE, Some(UNIT)).await {
             tracing::warn!("registry update failed: {e:#}");
         }
 
-        let exit = run_cycle(&agent, &target, interval, &stats, refresh_deadline).await;
-        tracing::info!("heartbeat: cycle ended ({exit}); reconnecting");
-    }
-}
-
-async fn run_cycle(
-    agent: &AgentClient,
-    target: &Arc<String>,
-    interval: Duration,
-    stats: &Arc<Mutex<HeartbeatStats>>,
-    refresh_deadline: tokio::time::Instant,
-) -> &'static str {
-    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
-    register_command_handler(agent.clone(), target.clone(), stats.clone(), watermark);
-
-    let sync_client = agent.client().clone();
-    let mut sync_task = tokio::spawn(async move {
-        sync_client.sync(SyncSettings::default()).await
-    });
-
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate first tick — the hello (or the previous cycle's last
-    // heartbeat) just went out; let the operator see the cadence.
-    tick.tick().await;
-
-    let exit = loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(refresh_deadline) => {
-                break "refresh-deadline";
+        let body = {
+            let s = self.stats.lock().await;
+            build_status(&s)
+        };
+        match agent.send_dm(target, &body).await {
+            Ok(event_id) => {
+                let mut s = self.stats.lock().await;
+                s.sent += 1;
+                s.last_err = None;
+                tracing::info!("heartbeat sent (event: {event_id})");
             }
-            res = &mut sync_task => {
-                match res {
-                    Ok(Ok(_)) => tracing::warn!("matrix sync returned Ok (unexpected)"),
-                    Ok(Err(e)) => tracing::warn!("matrix sync error: {e:#}"),
-                    Err(e) => tracing::warn!("matrix sync task join error: {e:#}"),
-                }
-                break "sync-ended";
-            }
-            _ = tick.tick() => {
-                send_heartbeat(agent, target, stats).await;
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::warn!("heartbeat send failed: {msg}");
+                let mut s = self.stats.lock().await;
+                s.last_err = Some(msg);
             }
         }
-    };
+    }
 
-    sync_task.abort();
-    let _ = sync_task.await;
-    exit
-}
-
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn register_command_handler(
-    agent: AgentClient,
-    target: Arc<String>,
-    stats: Arc<Mutex<HeartbeatStats>>,
-    watermark: Arc<AtomicU64>,
-) {
-    agent.client().add_event_handler({
-        let agent = agent.clone();
-        move |ev: OriginalSyncRoomMessageEvent, _room: Room| {
-            let agent = agent.clone();
-            let target = target.clone();
-            let stats = stats.clone();
-            let watermark = watermark.clone();
-            async move {
-                if let Err(e) = handle_event(ev, &agent, &target, &stats, &watermark).await {
-                    tracing::warn!("command handler error: {e:#}");
-                }
-            }
+    async fn handle_message(&self, agent: &AgentClient, target: &str, body: &str) {
+        // The relay forwards every text message from `target`; the ops channel
+        // only acts on `#shell` commands and ignores the rest.
+        let lower = body.to_lowercase();
+        if !(lower.starts_with("#shell ") || lower == "#shell") {
+            return;
         }
-    });
-}
 
-async fn handle_event(
-    ev: OriginalSyncRoomMessageEvent,
-    agent: &AgentClient,
-    target: &str,
-    stats: &Arc<Mutex<HeartbeatStats>>,
-    watermark: &AtomicU64,
-) -> anyhow::Result<()> {
-    if ev.sender.as_str() != target {
-        return Ok(());
-    }
-    let ts_ms = u64::from(ev.origin_server_ts.0);
-    // Atomic compare-and-swap-up: only advance, never go backward
-    let prev = watermark.load(Ordering::Relaxed);
-    if ts_ms <= prev {
-        return Ok(());
-    }
+        tracing::info!("command from {}: {}", target, body);
 
-    let body = match &ev.content.msgtype {
-        MessageType::Text(t) => t.body.trim().to_string(),
-        _ => return Ok(()),
-    };
+        let reply = {
+            let stats_guard = self.stats.lock().await;
+            handle_command(body, &stats_guard)
+        };
 
-    let lower = body.to_lowercase();
-    if !(lower.starts_with("#shell ") || lower == "#shell") {
-        // Non-command message from target — advance watermark so we don't keep
-        // reconsidering it on future ticks, but don't reply.
-        watermark
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if ts_ms > v {
-                    Some(ts_ms)
-                } else {
-                    None
-                }
-            })
-            .ok();
-        return Ok(());
-    }
-
-    tracing::info!("command from {}: {}", target, body);
-
-    let reply = {
-        let stats_guard = stats.lock().await;
-        handle_command(&body, &stats_guard)
-    };
-
-    watermark
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            if ts_ms > v {
-                Some(ts_ms)
-            } else {
-                None
-            }
-        })
-        .ok();
-
-    {
-        let mut s = stats.lock().await;
-        s.commands_handled += 1;
-    }
-
-    if let Err(e) = agent.send_dm(target, &reply).await {
-        tracing::warn!("command reply send failed: {e:#}");
-    }
-
-    Ok(())
-}
-
-async fn send_heartbeat(agent: &AgentClient, target: &str, stats: &Arc<Mutex<HeartbeatStats>>) {
-    // Refresh the fleet-registry entry every tick so `last_online` stays
-    // current. Best-effort — a registry failure must never skip the heartbeat.
-    if let Err(e) = agent.update_registry("heartbeat", Some("aqua-matrix-heartbeat")).await {
-        tracing::warn!("registry update failed: {e:#}");
-    }
-
-    let body = {
-        let s = stats.lock().await;
-        build_status(&s)
-    };
-    match agent.send_dm(target, &body).await {
-        Ok(event_id) => {
-            let mut s = stats.lock().await;
-            s.sent += 1;
-            s.last_err = None;
-            tracing::info!("heartbeat sent (event: {event_id})");
+        {
+            let mut s = self.stats.lock().await;
+            s.commands_handled += 1;
         }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            tracing::warn!("heartbeat send failed: {msg}");
-            let mut s = stats.lock().await;
-            s.last_err = Some(msg);
+
+        if let Err(e) = agent.send_dm(target, &reply).await {
+            tracing::warn!("command reply send failed: {e:#}");
         }
     }
 }
@@ -351,7 +165,7 @@ fn help_text() -> String {
     // would treat the `#shell`-prefixed lines as headings otherwise). The
     // surrounding sentences stay as prose so they render as normal text.
     [
-        "**aqua-matrix-agent heartbeat** — supported commands (prefix `#shell`):",
+        "**aqua-matrix-heartbeat** — supported commands (prefix `#shell`):",
         "```",
         "#shell help              this message",
         "#shell status            send a status payload now",
@@ -386,7 +200,7 @@ fn build_status(stats: &HeartbeatStats) -> String {
     // column-aligned labels, which Element would otherwise mangle (the divider
     // turns the line above into a setext heading and HTML collapses alignment).
     let mut out = String::from("```\n");
-    out.push_str(&format!("aqua-matrix-agent heartbeat @ {}\n", now_string()));
+    out.push_str(&format!("aqua-matrix-heartbeat @ {}\n", now_string()));
     out.push_str("----------------------------------------\n");
 
     out.push_str(&format!(
@@ -424,12 +238,7 @@ fn host_summary() -> String {
     let hostname = read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "?".into());
     let uptime = host_uptime().unwrap_or_else(|| "?".into());
     let load = read_trim("/proc/loadavg")
-        .map(|s| {
-            s.split_whitespace()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
         .unwrap_or_else(|| "?".into());
     let mem = memory_summary().unwrap_or_else(|| "?".into());
     let disk = disk_summary("/").unwrap_or_else(|| "?".into());
@@ -465,9 +274,7 @@ fn memory_summary() -> Option<String> {
     let total_gb = total_kb as f64 / 1024.0 / 1024.0;
     let avail_gb = avail_kb as f64 / 1024.0 / 1024.0;
     let used_pct = ((total_kb - avail_kb) as f64 / total_kb as f64) * 100.0;
-    Some(format!(
-        "{avail_gb:.1}/{total_gb:.1}GB free ({used_pct:.0}% used)"
-    ))
+    Some(format!("{avail_gb:.1}/{total_gb:.1}GB free ({used_pct:.0}% used)"))
 }
 
 fn parse_meminfo_kb(s: &str) -> Option<u64> {
@@ -526,10 +333,7 @@ fn claude_session_summary() -> Option<String> {
                         + field_u64(usage, "cache_creation_input_tokens");
                     if total > input_tokens {
                         input_tokens = total;
-                        model = msg
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
+                        model = msg.get("model").and_then(|v| v.as_str()).map(String::from);
                     }
                 }
                 if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
@@ -602,7 +406,7 @@ fn extract_text_from_content(content: Option<&serde_json::Value>) -> Option<Stri
 }
 
 fn find_latest_transcript(root: &Path) -> Option<PathBuf> {
-    let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
     walk(root, &mut |p| {
         if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             return;
@@ -678,13 +482,6 @@ fn now_string() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "?".into())
-}
-
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn format_duration(d: Duration) -> String {

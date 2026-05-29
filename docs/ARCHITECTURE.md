@@ -54,6 +54,19 @@ There are three components running on the host. Each does one thing, has its own
 | `aqua-matrix-claude-channel` | LLM channel. Free-form prose in, Claude output out. | `claude-channel.pem` | Conversational replies stop. Ops channel unaffected. |
 | `claude-bridge.service` | Persistent interactive Claude in tmux, for local human attachment via `tmux attach`. | none (host-local process) | Local interactive Claude unavailable. Both Matrix daemons unaffected. |
 
+## Workspace layout
+
+The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. Four crates live under `crates/`:
+
+| Crate | Role |
+|---|---|
+| `aqua-matrix-agent` | The library (`AgentClient`, `AgentConfig`, OIDC, recovery, registry) plus the one-shot `aqua-matrix-agent` CLI binary (`--message` / `--read` / `--print-did`). |
+| `aqua-matrix-relay` | Generic daemon framework: the `MessageHandler` trait + `run_daemon()` lifecycle (connect-rotate-sync-watermark). Ships `examples/echo_agent.rs`. |
+| `aqua-matrix-heartbeat` | Binary `aqua-matrix-heartbeat` — the ops/heartbeat agent (periodic status DM + `#shell` commands). |
+| `aqua-matrix-claude-p` | Binary `aqua-matrix-claude-p` — the reference example backend that forwards DMs to `claude -p`. |
+
+A single `cargo build` builds the whole workspace at once.
+
 ## Why two Matrix identities (not one)
 
 See the comparison in the chat history that led to this design. Summary:
@@ -213,7 +226,7 @@ WSL itself does **not** start on Windows boot unless triggered (open a WSL termi
 | `agent.pem` | Free chat identity for ad-hoc `aqua-matrix-agent` runs. | Binary, on first chat run. |
 | `agent-b.pem` | Second identity for `/e2e-test`. | E2E test setup. |
 | `heartbeat.pem` | Heartbeat daemon identity. | Renamed from auto-generated `agent.pem` during initial setup. |
-| `claude-channel.pem` | Claude-channel daemon identity. | Auto-generated on first `--claude-channel` run. |
+| `claude-channel.pem` | Claude-channel daemon identity. | Auto-generated on first `aqua-matrix-claude-p` run. |
 | `~/.aqua-matrix-heartbeat/` | Heartbeat sync state + config + session cache. | Heartbeat daemon. |
 | `~/.aqua-matrix-claude-channel/` | Claude-channel sync state + config + session cache. | Claude-channel daemon. |
 | `~/.config/systemd/user/aqua-matrix-heartbeat.service` | Heartbeat unit. | Operator install (`cp` from `systemd/`). |
@@ -228,4 +241,4 @@ Moved to [`RECOVERY.md`](RECOVERY.md) — its "Diagnostic decision tree" section
 
 ## Adding a fourth surface
 
-To add another Matrix-visible agent surface (e.g. a calendar bot, a code-review bot): generate a fresh `.pem`, register a fresh OIDC client (auto on first run), write a new mode in `src/`, ship a new systemd unit, enable it. Reuse the session-cache + event-handler patterns. Do NOT multiplex onto an existing identity — the whole point of this architecture is that each surface owns its channel.
+To add another Matrix-visible agent surface (e.g. a calendar bot, a code-review bot): implement the `MessageHandler` trait in a new crate (or as an example) and call `run_daemon()` from `aqua-matrix-relay` — that gives you the connect-rotate-sync-watermark lifecycle for free, so you only write the per-message logic. Then generate a fresh `.pem`, register a fresh OIDC client (auto on first run), ship a new systemd unit, and enable it. See [`docs/REFERENCE.md`](REFERENCE.md) and `crates/aqua-matrix-relay/examples/echo_agent.rs` for a minimal working handler. Do NOT multiplex onto an existing identity — the whole point of this architecture is that each surface owns its channel.

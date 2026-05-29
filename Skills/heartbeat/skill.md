@@ -5,7 +5,7 @@ description: Run aqua-matrix-agent as a heartbeat + Matrix command channel (dete
 
 # Heartbeat + Command Channel
 
-`--heartbeat` puts the agent into a dual-purpose daemon — see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design:
+The `aqua-matrix-heartbeat` binary is a dual-purpose daemon — see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design:
 
 1. **Heartbeat (outbound)**: every N seconds (default 600 = 10 min) it sends a status DM to `--target` containing agent, host, and Claude Code session facts.
 2. **Command channel (inbound)**: stream sync (matrix-sdk `client.sync()` in a background tokio task) plus an event handler delivers messages from `--target` within ~1s of arrival. Messages starting with `#shell` are parsed as commands and answered deterministically — no LLM involved.
@@ -39,7 +39,7 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 
 ```bash
 cd ~/aqua-matrix-hello
-./target/debug/aqua-matrix-agent --heartbeat
+./target/debug/aqua-matrix-heartbeat
 ```
 
 Stops on Ctrl+C / SIGTERM. Send failures are logged and retried next tick — the daemon does not crash on transient errors.
@@ -48,10 +48,10 @@ Stops on Ctrl+C / SIGTERM. Send failures are logged and retried next tick — th
 
 ```bash
 # Different recipient
-./target/debug/aqua-matrix-agent --heartbeat --target "@user:matrix.inblock.io"
+./target/debug/aqua-matrix-heartbeat --target "@user:matrix.inblock.io"
 
 # 5-minute interval instead of 10
-./target/debug/aqua-matrix-agent --heartbeat --heartbeat-interval 300
+./target/debug/aqua-matrix-heartbeat --interval 300
 ```
 
 ## Auto-start with WSL
@@ -125,7 +125,7 @@ The `claude` row may be omitted if no transcript with usage data is found (e.g. 
 ## Tuning
 
 - **Threshold for "ctx ~X%"**: derived from the Opus 4.7 1M variant (`CONTEXT_WINDOW=1000000`). Transcripts log the model as `claude-opus-4-7` without the `[1m]` suffix, so the env var override is the only reliable signal for the larger window. The systemd unit sets this — for foreground runs, export it yourself if needed.
-- **Interval**: pass `--heartbeat-interval <seconds>`. The systemd unit doesn't override it (uses the binary default 600).
+- **Interval**: pass `--interval <seconds>`. The systemd unit doesn't override it (uses the binary default 600).
 - **Recipient**: pass `--target` or run multiple agent identities via `--key-file` + `--store-dir`.
 
 ## Troubleshooting

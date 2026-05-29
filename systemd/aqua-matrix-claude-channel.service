@@ -17,7 +17,10 @@ Environment=CONTEXT_WINDOW=1000000
 # claude is at ~/.local/bin/claude; the daemon also resolves this dynamically
 # but setting PATH lets a future PATH-based claude lookup work too.
 Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --claude-channel --key-file claude-channel.pem --store-dir %h/.aqua-matrix-claude-channel
+# Reference example backend (was `aqua-matrix-agent --claude-channel` before
+# the workspace split). The unit name stays `aqua-matrix-claude-channel` so
+# `#shell respawn-channel`, the registry role, and skills are unaffected.
+ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-claude-p --key-file claude-channel.pem --store-dir %h/.aqua-matrix-claude-channel
 Restart=always
 RestartSec=5s
 StandardOutput=journal

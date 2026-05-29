@@ -62,11 +62,20 @@ Default to debug builds (release is much slower for iteration). The systemd unit
 
 ## Architecture
 
+This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. The four crates under `crates/`:
+
 ```
-aqua-matrix-agent (binary)
+aqua-matrix-hello (virtual workspace)
   |
-  +-- src/lib.rs     -- AgentClient: connect, send_dm, messages, cross-signing bootstrap
-  +-- src/main.rs    -- CLI: clap args, delegates to AgentClient
+  +-- crates/aqua-matrix-agent     -- library (AgentClient, AgentConfig, OIDC, recovery,
+  |                                   registry) + one-shot CLI binary `aqua-matrix-agent`
+  |                                   (--message / --read / --print-did only)
+  +-- crates/aqua-matrix-relay     -- generic daemon: MessageHandler trait + run_daemon()
+  |                                   lifecycle (connect-rotate-sync-watermark); examples/echo_agent.rs
+  +-- crates/aqua-matrix-heartbeat -- binary `aqua-matrix-heartbeat` (ops agent: periodic
+  |                                   status DM + #shell commands)
+  +-- crates/aqua-matrix-claude-p  -- binary `aqua-matrix-claude-p` (reference backend:
+                                      forwards DMs to `claude -p`)
   |
   +-- siwx-oidc-auth -- Headless OIDC client (CAIP-122 signature auth)
   +-- matrix-sdk     -- Matrix client with E2E encryption (Megolm/Vodozemac)
@@ -89,7 +98,7 @@ cargo test                                   # run unit tests (config roundtrip,
 cargo test --test e2e --features e2e         # run E2E test (requires live matrix.inblock.io)
 ```
 
-The binary lands at `target/debug/aqua-matrix-agent` (debug) or `target/debug/aqua-matrix-agent` (release). The systemd heartbeat unit points at the debug path on purpose — keeps rebuild cycles tight.
+A single `cargo build` builds the whole workspace, producing `target/debug/aqua-matrix-agent` (one-shot CLI), `target/debug/aqua-matrix-heartbeat`, and `target/debug/aqua-matrix-claude-p`. The systemd units point at the debug paths on purpose — keeps rebuild cycles tight.
 
 ## CLI flags
 
@@ -106,9 +115,8 @@ The binary lands at `target/debug/aqua-matrix-agent` (debug) or `target/debug/aq
 | `--read` | | | Read recent messages |
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |
-| `--heartbeat` | | | Run as a status-DM daemon (see `/heartbeat` skill) |
-| `--heartbeat-interval` | | `600` | Heartbeat tick in seconds |
-| `--claude-channel` | | | Run as the LLM bridge daemon — forwards inbound DMs from `--target` through `claude -p` (see `/claude-channel` skill) |
+
+These are the only flags on the `aqua-matrix-agent` binary — it is one-shot. The long-running daemons are now separate workspace binaries built from the same `cargo build`: `aqua-matrix-heartbeat` (status-DM + `#shell`; interval via `--interval <secs>`, see `/heartbeat` skill) and `aqua-matrix-claude-p` (forwards inbound DMs from `--target` through `claude -p`, see `/claude-channel` skill). See [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ## Wrapped-harness configuration
 
@@ -126,9 +134,9 @@ The hook reads the latest `usage.input_tokens` from the active transcript, so to
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
-| `/heartbeat` | Run aqua-matrix-agent as a daemon DMing status every 10min AND honoring `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell logs` commands sent from `--target` |
+| `/heartbeat` | Run the `aqua-matrix-heartbeat` binary — DMs status every 10min AND honors `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell logs` commands sent from `--target` |
 | `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawnable via `#shell respawn` |
-| `/claude-channel` | Matrix LLM channel daemon — separate identity, forwards DMs from `--target` to `claude -p` and replies with stdout; respawnable via `#shell respawn-channel` |
+| `/claude-channel` | Matrix LLM channel daemon (`aqua-matrix-claude-p` binary) — separate identity, forwards DMs from `--target` to `claude -p` and replies with stdout; respawnable via `#shell respawn-channel` |
 
 **Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:
 

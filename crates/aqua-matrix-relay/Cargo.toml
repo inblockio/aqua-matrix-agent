@@ -1,0 +1,19 @@
+[package]
+name = "aqua-matrix-relay"
+version.workspace = true
+edition.workspace = true
+description = "Generic Matrix agent daemon: a MessageHandler trait + run_daemon() lifecycle over siwx-oidc + Matrix. Drop in a backend and go."
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aqua-matrix-agent.workspace = true
+matrix-sdk.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The echo_agent example wires its own runtime.
+tokio.workspace = true

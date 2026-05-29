@@ -15,7 +15,9 @@ Type=simple
 # its matrix-sdk Client in-process ahead of every token expiry, so steady
 # state should no longer need a systemd restart to recover from
 # M_UNKNOWN_TOKEN.
-ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
+# Dedicated ops binary (was `aqua-matrix-agent --heartbeat` before the
+# workspace split; the relay lifecycle now lives in aqua-matrix-relay).
+ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
 Restart=always
 RestartSec=5s
 # Run in the repo dir so the default agent.pem key file is picked up

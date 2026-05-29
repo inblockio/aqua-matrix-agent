@@ -154,6 +154,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqua-matrix-claude-p"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-relay",
+ "async-trait",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aqua-matrix-heartbeat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-relay",
+ "async-trait",
+ "clap",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aqua-matrix-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-agent",
+ "async-trait",
+ "matrix-sdk",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aquamarine"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

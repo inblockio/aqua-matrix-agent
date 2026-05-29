@@ -1,9 +1,9 @@
 // matrix-sdk 0.17's deeply-nested async types overflow rustc's default
-// Send-bound recursion budget when we spawn `client.sync(...)` in a tokio task.
+// Send-bound recursion budget when a downstream crate spawns `client.sync(...)`
+// in a tokio task (the daemon lifecycle now lives in `aqua-matrix-relay`, but
+// the bound is hit through this crate's public API so the limit stays here).
 #![recursion_limit = "256"]
 
-pub mod heartbeat;
-pub mod claude_channel;
 mod recovery;
 mod registry;
 

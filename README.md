@@ -4,10 +4,13 @@ A Rust library and CLI for building Matrix agents that authenticate via [siwx-oi
 
 Each agent gets a deterministic DID derived from an Ed25519 key. Authentication goes through a CAIP-122 OIDC flow, giving the agent a Matrix account without passwords or manual registration.
 
+This is now a Cargo workspace and a **reference implementation** for any agent backend over Matrix + siwx-oidc: implement the `MessageHandler` trait and call `run_daemon()` from `aqua-matrix-relay` to ship your own long-running agent. The bundled `claude -p` daemon is just a placeholder backend.
+
 ## Features
 
 - **DID-based identity**: agents authenticate with Ed25519 keys, no passwords needed
 - **Library + CLI**: use `aqua_matrix_agent` as a crate in your own agent, or run the CLI directly
+- **Reference implementation**: a Cargo workspace where any backend can plug in via `MessageHandler` + `run_daemon` (see `aqua-matrix-relay`)
 - **Direct messaging**: send and read messages in DM rooms
 - **Auto-join**: automatically accepts room invitations
 - **SQLite session store**: persists sync state across restarts
@@ -22,20 +25,20 @@ Each agent gets a deterministic DID derived from an Ed25519 key. Authentication 
 
 ```bash
 # Build
-cargo build --release
+cargo build
 
 # Print the agent's DID (generates a key if none exists)
-./target/release/aqua-matrix-agent --print-did
+./target/debug/aqua-matrix-agent --print-did
 
 # Send a message
-./target/release/aqua-matrix-agent \
+./target/debug/aqua-matrix-agent \
   --client-id <YOUR_CLIENT_ID> \
   --redirect-uri <YOUR_REDIRECT_URI> \
   --target "@user:matrix.example.com" \
   --message "Hello from my agent"
 
 # Read recent messages
-./target/release/aqua-matrix-agent \
+./target/debug/aqua-matrix-agent \
   --client-id <YOUR_CLIENT_ID> \
   --redirect-uri <YOUR_REDIRECT_URI> \
   --target "@user:matrix.example.com" \
@@ -57,12 +60,12 @@ cargo build --release
 | `--read` | | | Read recent messages from the DM room |
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |
-| `--heartbeat` | | | Run as a heartbeat daemon (10-min status DMs by default) |
-| `--heartbeat-interval` | | `600` | Heartbeat interval in seconds |
 
-## Heartbeat daemon
+The `aqua-matrix-agent` binary is one-shot only (`--message` / `--read` / `--print-did`). The long-running daemons are now separate workspace binaries — `aqua-matrix-heartbeat` and `aqua-matrix-claude-p` — built from the same `cargo build`. See [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
-`--heartbeat` puts the binary into a loop that sends a Matrix DM every 10 minutes with agent, host, and (if present) active Claude Code session status. A ready-to-install systemd user unit ships at `systemd/aqua-matrix-heartbeat.service`. See `Skills/heartbeat/skill.md` for setup, payload format, and tuning.
+## Daemons
+
+The heartbeat and `claude -p` daemons are separate workspace binaries (`aqua-matrix-heartbeat`, `aqua-matrix-claude-p`), both built on the generic `aqua-matrix-relay` crate (implement the `MessageHandler` trait, call `run_daemon()` for the connect-rotate-sync-watermark lifecycle). The heartbeat sends a periodic status DM and honors `#shell` commands; `claude -p` forwards inbound DMs to the `claude` CLI. Ready-to-install systemd user units ship under `systemd/`. See [`docs/REFERENCE.md`](docs/REFERENCE.md) and `Skills/heartbeat/skill.md` for setup, payload format, and tuning.
 
 ## Using as a library
 

@@ -134,7 +134,7 @@ systemctl --user start <unit>           # try again
 
 ```bash
 systemctl --user stop <unit>            # halt the auto-restart cycle
-~/aqua-matrix-hello/target/debug/aqua-matrix-agent --heartbeat   # or whatever mode
+~/aqua-matrix-hello/target/debug/aqua-matrix-heartbeat   # or aqua-matrix-claude-p, whichever daemon
 # ... iterate. Ctrl+C when done. systemctl --user start <unit> to resume normal supervision.
 ```
 
