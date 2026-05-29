@@ -161,6 +161,7 @@ dependencies = [
  "aqua-matrix-relay",
  "async-trait",
  "clap",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

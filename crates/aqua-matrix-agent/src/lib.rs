@@ -8,16 +8,16 @@ mod recovery;
 mod registry;
 
 use anyhow::{anyhow, Context, Result};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use matrix_sdk::{
     config::SyncSettings,
     room::MessagesOptions,
     ruma::{
         events::{
-            room::message::{MessageType, RoomMessageEventContent},
+            room::message::{MessageType, ReplacementMetadata, RoomMessageEventContent},
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         },
-        OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
+        OwnedDeviceId, OwnedEventId, OwnedUserId, RoomId, UInt, UserId,
     },
     Client, SessionMeta, SessionTokens,
 };
@@ -749,6 +749,172 @@ impl AgentClient {
             .context("sync failed")?;
         Ok(())
     }
+
+    /// Show a Matrix typing indicator ("<agent> is typing…") to `target` until
+    /// the returned guard is dropped. Returns `None` if no DM room exists yet.
+    /// The guard refreshes the notice every few seconds (the homeserver expires
+    /// it after ~4s) and clears it on drop — use it to signal "working" during a
+    /// slow operation like an LLM call.
+    pub async fn typing_guard(&self, target: &str) -> Option<TypingGuard> {
+        let target: &UserId = target.try_into().ok()?;
+        let room = self.find_dm_room(target).await?;
+        Some(TypingGuard::start(room))
+    }
+
+    /// Begin a streaming reply to `target`: sends a placeholder message now and
+    /// returns a handle whose [`ReplyStream::push`] / [`ReplyStream::finish`]
+    /// edit that same message in place (Matrix `m.replace`), so an answer
+    /// appears to type out instead of landing as one block. Errors if no DM room
+    /// exists yet — callers should fall back to [`AgentClient::send_dm`].
+    pub async fn reply_stream(&self, target: &str) -> Result<ReplyStream> {
+        let target_uid: &UserId = target
+            .try_into()
+            .map_err(|e| anyhow!("invalid target: {e}"))?;
+        let room = self
+            .find_dm_room(target_uid)
+            .await
+            .ok_or_else(|| anyhow!("no DM room with {target} for a streaming reply"))?;
+        ReplyStream::start(room).await
+    }
+}
+
+/// How often to push an in-place edit while streaming. Editing per token would
+/// flood the room with events (each a separate, E2E-encrypted `m.replace`); one
+/// edit every ~700ms reads as smooth typing without the spam.
+const STREAM_EDIT_INTERVAL: Duration = Duration::from_millis(700);
+/// Cap on a streamed reply's size. Matrix accepts more, but be polite.
+const STREAM_MAX_BYTES: usize = 16_000;
+
+/// RAII typing indicator, created by [`AgentClient::typing_guard`]. Refreshes
+/// the `m.typing` notice on a timer and clears it on drop.
+pub struct TypingGuard {
+    room: matrix_sdk::Room,
+    keepalive: tokio::task::JoinHandle<()>,
+}
+
+impl TypingGuard {
+    fn start(room: matrix_sdk::Room) -> Self {
+        let r = room.clone();
+        let keepalive = tokio::spawn(async move {
+            // The homeserver expires a typing notice after ~4s; refresh inside
+            // that window. matrix-sdk debounces the actual network sends.
+            loop {
+                if r.typing_notice(true).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+        Self { room, keepalive }
+    }
+}
+
+impl Drop for TypingGuard {
+    fn drop(&mut self) {
+        self.keepalive.abort();
+        // Drop can't be async; fire-and-forget the "stopped typing" notice.
+        let room = self.room.clone();
+        tokio::spawn(async move {
+            let _ = room.typing_notice(false).await;
+        });
+    }
+}
+
+/// A reply that is edited in place as content arrives, created by
+/// [`AgentClient::reply_stream`]. Backed by one message plus throttled
+/// `m.replace` edits — the official Matrix way to approximate streaming, since
+/// the protocol has no token-stream primitive.
+pub struct ReplyStream {
+    room: matrix_sdk::Room,
+    event_id: OwnedEventId,
+    buf: String,
+    last_edit: Instant,
+    pending: bool,
+}
+
+impl ReplyStream {
+    async fn start(room: matrix_sdk::Room) -> Result<Self> {
+        let resp = room
+            .send(RoomMessageEventContent::text_plain("…"))
+            .await
+            .context("failed to send streaming placeholder")?;
+        Ok(Self {
+            room,
+            event_id: resp.response.event_id.clone(),
+            buf: String::new(),
+            last_edit: Instant::now(),
+            pending: false,
+        })
+    }
+
+    /// Append `chunk` to the reply, editing the message in place at most once
+    /// per [`STREAM_EDIT_INTERVAL`]. Intermediate states get a cursor and
+    /// balanced code fences so half-streamed Markdown still renders cleanly.
+    pub async fn push(&mut self, chunk: &str) -> Result<()> {
+        self.buf.push_str(chunk);
+        self.pending = true;
+        if self.last_edit.elapsed() >= STREAM_EDIT_INTERVAL {
+            let rendered = render_streaming(&self.buf);
+            self.edit(&rendered).await?;
+            self.last_edit = Instant::now();
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    /// Finalize the reply. `final_text` (e.g. the authoritative full result)
+    /// replaces the accumulated buffer when given; otherwise the buffer is used.
+    /// The final edit drops the streaming cursor.
+    pub async fn finish(self, final_text: Option<&str>) -> Result<()> {
+        let text = final_text
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.buf.clone());
+        let text = if text.trim().is_empty() {
+            "(no output)".to_string()
+        } else {
+            truncate_bytes(&text, STREAM_MAX_BYTES)
+        };
+        self.edit(&text).await
+    }
+
+    async fn edit(&self, body: &str) -> Result<()> {
+        // Build the replacement directly rather than via Room::make_edit_event,
+        // which fetches the target event from the server on every call (a
+        // round-trip per edit, and racy right after we send the placeholder).
+        // We are the author and already hold the event id, so this is safe.
+        let content = RoomMessageEventContent::text_markdown(body)
+            .make_replacement(ReplacementMetadata::new(self.event_id.clone(), None));
+        self.room
+            .send(content)
+            .await
+            .context("failed to send streaming edit")?;
+        Ok(())
+    }
+}
+
+/// Render an in-progress buffer: cap length, balance an odd ``` fence so a
+/// half-streamed code block doesn't swallow the rest, and append a cursor.
+fn render_streaming(buf: &str) -> String {
+    let mut s = truncate_bytes(buf, STREAM_MAX_BYTES);
+    if s.matches("```").count() % 2 == 1 {
+        s.push_str("\n```");
+    }
+    s.push_str(" ▌");
+    s
+}
+
+/// Truncate `s` to at most `max_bytes`, on a UTF-8 char boundary.
+fn truncate_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n[…truncated]");
+    out
 }
 
 #[cfg(test)]

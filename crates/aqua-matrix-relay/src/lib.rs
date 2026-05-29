@@ -42,12 +42,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use matrix_sdk::{
     config::SyncSettings,
     room::Room,
-    ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
+    ruma::{
+        api::client::receipt::create_receipt::v3::ReceiptType,
+        events::{
+            receipt::ReceiptThread,
+            room::message::{MessageType, OriginalSyncRoomMessageEvent},
+        },
+    },
 };
 
 // Re-export everything a handler crate needs so it can depend on ONLY this
 // crate (plus tokio for its `main`). A new agent never imports matrix-sdk.
-pub use aqua_matrix_agent::{AgentClient, AgentConfig};
+// ReplyStream / TypingGuard let handlers stream answers and show "typing…".
+pub use aqua_matrix_agent::{AgentClient, AgentConfig, ReplyStream, TypingGuard};
 pub use async_trait::async_trait;
 
 /// Rotate the client `REFRESH_GUARD_SECS` before the access token expires. 30 s
@@ -255,13 +262,13 @@ fn register_handler<H: MessageHandler>(
 ) {
     agent.client().add_event_handler({
         let agent = agent.clone();
-        move |ev: OriginalSyncRoomMessageEvent, _room: Room| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let agent = agent.clone();
             let target = target.clone();
             let handler = handler.clone();
             let watermark = watermark.clone();
             async move {
-                dispatch(ev, &agent, &target, &handler, &watermark).await;
+                dispatch(ev, room, &agent, &target, &handler, &watermark).await;
             }
         }
     });
@@ -269,6 +276,7 @@ fn register_handler<H: MessageHandler>(
 
 async fn dispatch<H: MessageHandler>(
     ev: OriginalSyncRoomMessageEvent,
+    room: Room,
     agent: &AgentClient,
     target: &str,
     handler: &Arc<H>,
@@ -282,6 +290,18 @@ async fn dispatch<H: MessageHandler>(
     let ts_ms = u64::from(ev.origin_server_ts.0);
     if ts_ms <= watermark.load(Ordering::Relaxed) {
         return;
+    }
+
+    // Instant "seen" acknowledgement (fire-and-forget): the user gets feedback
+    // that the message landed before any handler latency. Best-effort.
+    {
+        let room = room.clone();
+        let event_id = ev.event_id.clone();
+        tokio::spawn(async move {
+            let _ = room
+                .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
+                .await;
+        });
     }
 
     let body = match &ev.content.msgtype {
