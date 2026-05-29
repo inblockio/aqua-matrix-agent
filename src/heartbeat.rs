@@ -36,6 +36,12 @@ const REFRESH_GUARD_SECS: u64 = 30;
 /// already arrived close to expiry — better to rotate immediately than to
 /// hammer siwx-oidc, but still give one heartbeat tick a chance to fire.
 const MIN_CYCLE_SECS: u64 = 15;
+/// After this many consecutive `AgentClient::connect` failures, exit so
+/// systemd's `Restart=always` brings up a fresh process. The connect path
+/// can leak matrix-sdk / SQLite resources on partial-build failures; a
+/// fresh process resets that state. `StartLimitBurst` still guards against
+/// runaway restarts.
+const MAX_CONNECT_FAILURES: u32 = 3;
 
 pub struct HeartbeatStats {
     start: Instant,
@@ -69,11 +75,24 @@ pub async fn run(config: AgentConfig, target: &str, interval: Duration) {
     );
 
     let mut first_cycle = true;
+    let mut consecutive_failures: u32 = 0;
     loop {
         let agent = match AgentClient::connect(config.clone()).await {
-            Ok(a) => a,
+            Ok(a) => {
+                consecutive_failures = 0;
+                a
+            }
             Err(e) => {
-                tracing::error!("heartbeat: AgentClient::connect failed: {e:#}; retrying in 10s");
+                consecutive_failures += 1;
+                tracing::error!(
+                    "heartbeat: AgentClient::connect failed ({consecutive_failures}/{MAX_CONNECT_FAILURES}): {e:#}"
+                );
+                if consecutive_failures >= MAX_CONNECT_FAILURES {
+                    tracing::error!(
+                        "heartbeat: {MAX_CONNECT_FAILURES} consecutive connect failures; exiting for systemd Restart=always (avoids in-process resource accumulation)"
+                    );
+                    std::process::exit(1);
+                }
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
