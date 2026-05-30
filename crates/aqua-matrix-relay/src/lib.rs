@@ -46,7 +46,10 @@ use matrix_sdk::{
         api::client::receipt::create_receipt::v3::ReceiptType,
         events::{
             receipt::ReceiptThread,
-            room::message::{MessageType, OriginalSyncRoomMessageEvent},
+            room::{
+                member::{MembershipState, StrippedRoomMemberEvent},
+                message::{MessageType, OriginalSyncRoomMessageEvent},
+            },
         },
     },
 };
@@ -160,8 +163,39 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
             }
         };
 
-        if let Err(e) = agent.join_invited_rooms().await {
-            tracing::warn!("{}: join_invited_rooms failed: {e:#}", handler.role());
+        // Sync once first so a pending invite is actually visible: right after
+        // connect the initial sync may not yet carry an invite the peer sent
+        // moments earlier, and `join_invited_rooms` would then join nothing.
+        if let Err(e) = agent.sync_once().await {
+            tracing::warn!("{}: pre-join sync_once failed: {e:#}", handler.role());
+        }
+
+        // Join pending invites, then record each joined room as the DM with our
+        // peer. A freshly connected client has empty `m.direct` and an
+        // unpopulated member list, so without this the first outbound message
+        // (the hello below) fails to resolve the shared room and `create_dm`
+        // spawns a DUPLICATE — which, against a programmatic peer, splits the two
+        // sides into separate rooms and breaks Megolm key exchange (in
+        // production it leaves stray empty rooms). The peer is the only party
+        // that DMs us, so any room it invited us to IS the DM room.
+        match agent.join_invited_rooms().await {
+            Ok(joined) => {
+                for room_id in &joined {
+                    if let Err(e) = agent.mark_dm(room_id, &target).await {
+                        tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
+                    } else {
+                        tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("{}: join_invited_rooms failed: {e:#}", handler.role()),
+        }
+
+        // One sync so the peer's device keys are known before we encrypt the
+        // hello (otherwise the hello is undecryptable on their side until the
+        // next round-trip). Best-effort.
+        if let Err(e) = agent.sync_once().await {
+            tracing::warn!("{}: settle sync_once failed: {e:#}", handler.role());
         }
 
         let now = unix_now_secs();
@@ -189,8 +223,21 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
                 tracing::info!("{}: display name set to {:?}", handler.role(), alias);
             }
             if let Some(hello) = handler.hello(&agent) {
-                if let Err(e) = agent.send_dm(&target, &hello).await {
-                    tracing::warn!("{}: hello send failed: {e:#}", handler.role());
+                // Only greet into an EXISTING DM room. If none resolves yet (the
+                // peer's invite hasn't been synced/joined), sending would
+                // `create_dm` a stray duplicate room and pollute m.direct — skip
+                // it; the auto-join handler will pick up the real room and the
+                // first real exchange establishes Megolm there anyway.
+                match agent.dm_room_id(&target).await {
+                    Ok(Some(_)) => {
+                        if let Err(e) = agent.send_dm(&target, &hello).await {
+                            tracing::warn!("{}: hello send failed: {e:#}", handler.role());
+                        }
+                    }
+                    _ => tracing::info!(
+                        "{}: no DM room yet; deferring hello (auto-join will converge)",
+                        handler.role()
+                    ),
                 }
             }
             first_cycle = false;
@@ -221,6 +268,10 @@ async fn run_cycle<H: MessageHandler>(
     // arrive during this cycle. Advanced monotonically as messages are seen.
     let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
     register_handler(agent.clone(), target.clone(), handler.clone(), watermark);
+    // Auto-join invites as they arrive on the sync stream (not only at cycle
+    // start), so an invite the peer sends mid-cycle — or just after connect,
+    // before the startup join sees it — is still joined and recorded as the DM.
+    register_invite_autojoin(agent.clone(), target.clone(), handler.role().to_string());
 
     let sync_client = agent.client().clone();
     let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
@@ -271,6 +322,41 @@ fn log_sync_end(res: Result<matrix_sdk::Result<()>, tokio::task::JoinError>) {
     }
 }
 
+/// Continuously auto-join rooms we are invited to (and record them as the DM
+/// with our peer), so the daemon converges on the SAME room the peer created
+/// rather than `create_dm` later spawning a duplicate. Registered on the sync
+/// stream so it fires whenever an invite arrives, not just at cycle start.
+fn register_invite_autojoin(agent: AgentClient, target: Arc<String>, role: String) {
+    let own = agent.user_id().to_string();
+    agent.client().add_event_handler({
+        let agent = agent.clone();
+        move |ev: StrippedRoomMemberEvent, room: Room| {
+            let agent = agent.clone();
+            let target = target.clone();
+            let role = role.clone();
+            let own = own.clone();
+            async move {
+                // Only act on an invite addressed to us.
+                if ev.state_key.as_str() != own
+                    || ev.content.membership != MembershipState::Invite
+                {
+                    return;
+                }
+                match room.join().await {
+                    Ok(()) => {
+                        let room_id = room.room_id().to_string();
+                        tracing::info!("{role}: auto-joined invited room {room_id}");
+                        if let Err(e) = agent.mark_dm(&room_id, &target).await {
+                            tracing::warn!("{role}: mark_dm({room_id}) after auto-join failed: {e:#}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("{role}: auto-join failed: {e:#}"),
+                }
+            }
+        }
+    });
+}
+
 fn register_handler<H: MessageHandler>(
     agent: AgentClient,
     target: Arc<String>,
@@ -300,8 +386,11 @@ async fn dispatch<H: MessageHandler>(
     watermark: &AtomicU64,
 ) {
     // Only messages from the configured peer, and only ones newer than anything
-    // we've already seen this cycle.
-    if ev.sender.as_str() != target {
+    // we've already seen this cycle. Compare case-insensitively: Synapse
+    // canonicalises MXIDs to lowercase, so `ev.sender` is lowercased, while a
+    // `--target` derived from a mixed-case `did:key` is not — an exact compare
+    // would silently drop every inbound message from such a peer.
+    if !ev.sender.as_str().eq_ignore_ascii_case(target) {
         return;
     }
     let ts_ms = u64::from(ev.origin_server_ts.0);

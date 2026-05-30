@@ -595,6 +595,28 @@ impl AgentClient {
             .map(|r| r.room_id().to_string()))
     }
 
+    /// Record `room_id` as the direct (DM) room for `target` in `m.direct`
+    /// account data, so a later `find_dm_room`/`send_dm` resolves it
+    /// deterministically — without waiting for a full membership sync. A daemon
+    /// that has just *joined* an invite should call this so its first outbound
+    /// message (e.g. a hello) reuses the shared room the peer created, instead
+    /// of `create_dm` spawning a duplicate room (which splits the two sides into
+    /// separate rooms and breaks Megolm key exchange). Best-effort by the caller.
+    pub async fn mark_dm(&self, room_id: &str, target: &str) -> Result<()> {
+        let room_id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let target: &UserId = target
+            .try_into()
+            .map_err(|e| anyhow!("invalid target: {e}"))?;
+        self.client
+            .account()
+            .mark_as_dm(room_id, &[target.to_owned()])
+            .await
+            .context("mark_as_dm failed")?;
+        Ok(())
+    }
+
     pub async fn send_dm(&self, target: &str, message: &str) -> Result<String> {
         let target: &UserId = target
             .try_into()
